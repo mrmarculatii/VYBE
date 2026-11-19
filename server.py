@@ -37,6 +37,7 @@ def init():
      activities=[(0,7+offset,'sleep','Residence'),(8+offset,9+offset,'breakfast','Dining Hall'),(10+offset,12+offset,'lecture',ch['major']+' Department'),(13+offset,14+offset,'lunch','Dining Hall'),(15+offset,17+offset,'study','Library'),(23,24,'sleep','Residence')]
      if wd>=5:activities=[(0,8+offset,'sleep','Residence'),(10,12,'free time','Campus'),(13,15,'social time','Courtyard'),(23,24,'sleep','Residence')]
      for start,end,activity,location in activities:c.execute('INSERT OR IGNORE INTO npc_schedule(character,weekday,start_hour,end_hour,activity,location) VALUES (?,?,?,?,?,?)',(uid,wd,start,end,activity,location))
+  c.executescript("""CREATE TABLE IF NOT EXISTS relationships(character INTEGER PRIMARY KEY, affinity INTEGER DEFAULT 0, familiarity INTEGER DEFAULT 0, last_interaction TEXT); CREATE TABLE IF NOT EXISTS social_activity(id INTEGER PRIMARY KEY,actor INTEGER,action TEXT,target INTEGER,created TEXT);""")
   c.commit();c.close()
 init()
 
@@ -66,7 +67,7 @@ def logout(request:Request):
  r=JSONResponse({'ok':True});r.delete_cookie('vybe_session');return r
 @app.get('/api/state')
 def state(request:Request):
- auth(request);c=connect();result={'clock':now(c),'story_mode':getmeta(c,'story_mode'),'speed':float(getmeta(c,'speed')),'paused':getmeta(c,'paused')=='1','characters':rows(c,'SELECT id,name,handle,rank,magic,major,bio,avatar FROM characters'),'posts':rows(c,'''SELECT p.*,a.name,a.handle,a.rank,(SELECT COUNT(*) FROM reactions r WHERE r.post=p.id AND r.kind='like') likes,(SELECT COUNT(*) FROM comments cm WHERE cm.post=p.id) comments,(SELECT COUNT(*) FROM reactions r WHERE r.post=p.id AND r.user=1 AND r.kind='like') liked,(SELECT COUNT(*) FROM reactions r WHERE r.post=p.id AND r.user=1 AND r.kind='save') saved FROM posts p JOIN characters a ON a.id=p.author WHERE p.expires IS NULL OR p.expires>? ORDER BY p.id DESC LIMIT 150''',(now(c),)),'schedule':rows(c,'SELECT * FROM npc_schedule ORDER BY character,weekday,start_hour'),'canon_events':rows(c,'SELECT * FROM canon_events ORDER BY created_real DESC LIMIT 80'),'notifications':rows(c,'SELECT * FROM notifications ORDER BY id DESC LIMIT 30'),'events':rows(c,'SELECT * FROM events ORDER BY id DESC LIMIT 50'),'log':rows(c,'SELECT * FROM worldlog ORDER BY id DESC LIMIT 40'),'following':[x['followed'] for x in rows(c,'SELECT followed FROM follows WHERE follower=1')]};c.close();return result
+ auth(request);c=connect();result={'clock':now(c),'story_mode':getmeta(c,'story_mode'),'speed':float(getmeta(c,'speed')),'paused':getmeta(c,'paused')=='1','characters':rows(c,'SELECT id,name,handle,rank,magic,major,bio,avatar FROM characters'),'posts':rows(c,'''SELECT p.*,a.name,a.handle,a.rank,(SELECT COUNT(*) FROM reactions r WHERE r.post=p.id AND r.kind='like') likes,(SELECT COUNT(*) FROM comments cm WHERE cm.post=p.id) comments,(SELECT COUNT(*) FROM reactions r WHERE r.post=p.id AND r.user=1 AND r.kind='like') liked,(SELECT COUNT(*) FROM reactions r WHERE r.post=p.id AND r.user=1 AND r.kind='save') saved FROM posts p JOIN characters a ON a.id=p.author WHERE p.expires IS NULL OR p.expires>? ORDER BY p.id DESC LIMIT 150''',(now(c),)),'schedule':rows(c,'SELECT * FROM npc_schedule ORDER BY character,weekday,start_hour'),'canon_events':rows(c,'SELECT * FROM canon_events ORDER BY created_real DESC LIMIT 80'),'notifications':rows(c,'SELECT * FROM notifications ORDER BY id DESC LIMIT 30'),'events':rows(c,'SELECT * FROM events ORDER BY id DESC LIMIT 50'),'log':rows(c,'SELECT * FROM worldlog ORDER BY id DESC LIMIT 40'),'relationships':rows(c,'SELECT * FROM relationships'),'activity':rows(c,'SELECT * FROM social_activity ORDER BY id DESC LIMIT 40'),'following':[x['followed'] for x in rows(c,'SELECT followed FROM follows WHERE follower=1')]};c.close();return result
 class PostIn(BaseModel):body:str;channel:str='general';kind:str='post';media:str=''
 @app.post('/api/posts')
 def post(body:PostIn,request:Request):
@@ -84,13 +85,16 @@ def react(body:React,request:Request):
  c=connect();r=c.execute('SELECT 1 FROM reactions WHERE user=1 AND post=? AND kind=?',(body.post,body.kind)).fetchone()
  if r:c.execute('DELETE FROM reactions WHERE user=1 AND post=? AND kind=?',(body.post,body.kind))
  else:c.execute('INSERT INTO reactions VALUES (1,?,?)',(body.post,body.kind))
- c.commit();c.close();return {'active':not bool(r)}
+ c.execute('INSERT INTO social_activity(actor,action,target,created) VALUES (?,?,?,?)',(1,'unliked' if r else 'liked',body.post,now(c)));c.commit();c.close();return {'active':not bool(r)}
 class Comment(BaseModel):post:int;body:str;parent:int|None=None
 @app.post('/api/comments')
 def comment(body:Comment,request:Request):
  auth(request)
  if not body.body.strip() or len(body.body)>1000:raise HTTPException(400,'Invalid comment')
- c=connect();c.execute('INSERT INTO comments(post,author,body,created,parent) VALUES (?,?,?,?,?)',(body.post,1,body.body.strip(),now(c),body.parent));c.commit();c.close();return {'ok':True}
+ c=connect()
+ if not c.execute('SELECT 1 FROM posts WHERE id=?',(body.post,)).fetchone():c.close();raise HTTPException(404,'Post not found')
+ if body.parent is not None and not c.execute('SELECT 1 FROM comments WHERE id=? AND post=?',(body.parent,body.post)).fetchone():c.close();raise HTTPException(400,'Reply must belong to this post')
+ c.execute('INSERT INTO comments(post,author,body,created,parent) VALUES (?,?,?,?,?)',(body.post,1,body.body.strip(),now(c),body.parent));c.execute('INSERT INTO social_activity(actor,action,target,created) VALUES (?,?,?,?)',(1,'commented',body.post,now(c)));c.commit();c.close();return {'ok':True}
 @app.get('/api/comments/{pid}')
 def comments(pid:int,request:Request):
  auth(request);c=connect();r=rows(c,'SELECT cm.*,a.name,a.handle FROM comments cm JOIN characters a ON cm.author=a.id WHERE post=? ORDER BY cm.id',(pid,));c.close();return r
@@ -101,7 +105,7 @@ def follow(uid:int,request:Request):
  c=connect();r=c.execute('SELECT 1 FROM follows WHERE follower=1 AND followed=?',(uid,)).fetchone()
  if r:c.execute('DELETE FROM follows WHERE follower=1 AND followed=?',(uid,))
  else:c.execute('INSERT INTO follows VALUES (1,?)',(uid,))
- c.commit();c.close();return {'following':not bool(r)}
+ c.execute('INSERT INTO social_activity(actor,action,target,created) VALUES (?,?,?,?)',(1,'unfollowed' if r else 'followed',uid,now(c)));c.commit();c.close();return {'following':not bool(r)}
 @app.get('/api/messages/{uid}')
 def messages(uid:int,request:Request):
  auth(request);c=connect();r=rows(c,'SELECT * FROM messages WHERE (sender=1 AND recipient=?) OR (sender=? AND recipient=1) ORDER BY id',(uid,uid));c.execute('UPDATE messages SET read_at=? WHERE sender=? AND recipient=1 AND read_at IS NULL',(now(c),uid));c.commit();c.close();return r
@@ -114,9 +118,13 @@ def send(body:Msg,request:Request):
  if not ch:raise HTTPException(404,'Student not found')
  t=now(c);c.execute('INSERT INTO messages(sender,recipient,body,created) VALUES (1,?,?,?)',(body.recipient,body.body.strip(),t))
  c.execute('INSERT INTO memories(character,summary,source,created) VALUES (?,?,?,?)',(body.recipient,'Celestia sent: '+body.body[:300],'message',t))
+ c.execute('INSERT INTO relationships(character,affinity,familiarity,last_interaction) VALUES (?,?,?,?) ON CONFLICT(character) DO UPDATE SET familiarity=MIN(100,familiarity+1),last_interaction=excluded.last_interaction',(body.recipient,0,1,t))
  # Scheduling is deterministic in availability class, variable in precise timing; no reply is guaranteed.
  hour=datetime.fromisoformat(t).hour; base=(8-hour)*60 if hour<8 else (32-hour)*60 if hour>=23 else 0
  rng=random.SystemRandom();delay=base+rng.choice([8,24,45,90,180,300,480]);chance=.6 if 8<=hour<23 else .32
+ schedule=c.execute('SELECT activity FROM npc_schedule WHERE character=? AND weekday=? AND start_hour<=? AND end_hour>? ORDER BY priority DESC LIMIT 1',(body.recipient,datetime.fromisoformat(t).weekday(),hour,hour)).fetchone()
+ if schedule and schedule['activity']=='sleep':chance*=.15;delay+=rng.randint(120,360)
+ elif schedule and schedule['activity'] in ('lecture','study'):chance*=.65;delay+=rng.randint(30,150)
  if rng.random()<chance:
   due=(datetime.fromisoformat(t)+timedelta(minutes=delay)).isoformat();c.execute('INSERT INTO events(kind,payload,due,created) VALUES (?,?,?,?)',('reply',json.dumps({'sender':body.recipient,'recipient':1,'source':body.body[:500]}),due,t))
  c.commit();c.close();return {'ok':True,'reply_guaranteed':False}
@@ -168,10 +176,23 @@ def media(name:str,request:Request):
  if not p.exists():raise HTTPException(404)
  return FileResponse(p)
 
+@app.post('/api/notifications/read')
+def notifications_read(request:Request):
+ auth(request);c=connect();c.execute('UPDATE notifications SET seen=1');c.commit();c.close();return {'ok':True}
+
+@app.get('/api/campus-live')
+def campus_live(request:Request):
+ auth(request);c=connect();t=datetime.fromisoformat(now(c));result=[]
+ for ch in rows(c,'SELECT id,name,major,rank FROM characters WHERE id>1'):
+  sched=c.execute('SELECT activity,location FROM npc_schedule WHERE character=? AND weekday=? AND start_hour<=? AND end_hour>? ORDER BY priority DESC LIMIT 1',(ch['id'],t.weekday(),t.hour,t.hour)).fetchone()
+  activity=sched['activity'] if sched else 'free time';location=sched['location'] if sched else 'Campus'
+  result.append({'id':ch['id'],'name':ch['name'],'rank':ch['rank'],'activity':activity,'location':location,'available':activity not in ('sleep','lecture')})
+ c.close();return {'clock':t.isoformat(),'students':result}
+
 def ai_reply(character,source,memories):
  key=os.getenv('OPENAI_API_KEY');model=os.getenv('VYBE_AI_MODEL','gpt-4.1-mini')
  if not key:return None
- prompt='You are a fictional university student. Stay in character. Never speak for Celestia. You do not know any author-only secrets. Reply naturally in 1-3 sentences, or output exactly [IGNORE] if you would not respond. Student: '+character['name']+'. Traits: '+character['personality']+'. Prior accessible memory: '+str(memories)[-1500:]+' Message from Celestia: '+source
+ prompt='You are a fictional Eidolon University student in a private pre-chapter-one sandbox. Stay in character, remember your independent life and boundaries. Never speak for Celestia or assume her choices, divine nature, or secrets. Do not invent confirmed canon. Be distinctive, casual, and sometimes terse. Reply naturally in 1-3 sentences, or output exactly [IGNORE] if you would not respond. Student: '+character['name']+'. Traits: '+character['personality']+'. Prior accessible memory: '+str(memories)[-1500:]+' Message from Celestia: '+source
  data=json.dumps({'model':model,'messages':[{'role':'system','content':'Roleplay as the named fictional student, with realistic boundaries and no access to hidden canon.'},{'role':'user','content':prompt}],'max_tokens':160}).encode()
  try:
   req=urllib.request.Request('https://api.openai.com/v1/chat/completions',data,{'Authorization':'Bearer '+key,'Content-Type':'application/json'})
