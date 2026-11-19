@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: vybe-private
+    runtime: docker
+    plan: starter
+    healthCheckPath: /
+    disk:
+      name: vybe-persistent-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: VYBE_DATA_DIR
+        value: /app/data
+      - key: VYBE_COOKIE_SECURE
+        value: '1'
+      - key: VYBE_WORKER
+        value: '1'
+      - key: VYBE_PASSWORD
+        sync: false
+      - key: VYBE_SESSION_SECRET
+        generateValue: true
