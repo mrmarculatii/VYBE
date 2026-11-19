@@ -295,3 +295,97 @@ def restore_snapshot(sid:int,request:Request):
   source=sqlite3.connect(str(path));target=connect();source.backup(target);source.close();target.close()
   c=connect();setmeta(c,'paused','1');setmeta(c,'last_tick',time.time());c.execute("UPDATE events SET status='pending' WHERE status='processing'");c.commit();c.close()
  return {'ok':True,'paused':True}
+
+
+# Story Bridge v1: append-only, idempotent event inbox. A stored event is not
+# automatically canon, public knowledge, or an instruction to control Celestia.
+def bridge_auth(request:Request):
+    configured=os.getenv('VYBE_BRIDGE_TOKEN','')
+    supplied=request.headers.get('X-VYBE-Bridge-Token','')
+    if configured and supplied and hmac.compare_digest(configured,supplied):return
+    auth(request)
+
+def bridge_init():
+    with lock:
+        c=connect()
+        c.execute("""CREATE TABLE IF NOT EXISTS bridge_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          external_id TEXT NOT NULL UNIQUE,
+          fictional_time TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          participants TEXT NOT NULL DEFAULT '[]',
+          location TEXT,
+          visibility TEXT NOT NULL DEFAULT 'author',
+          source TEXT NOT NULL DEFAULT 'chatgpt_roleplay',
+          status TEXT NOT NULL DEFAULT 'staged',
+          details TEXT NOT NULL DEFAULT '{}',
+          received_at TEXT NOT NULL
+        )""")
+        c.commit();c.close()
+bridge_init()
+
+class BridgeEventIn(BaseModel):
+    external_id:str|None=None
+    fictional_time:str|None=None
+    event_type:str='scene_event'
+    summary:str
+    participants:list[str]=[]
+    location:str|None=None
+    visibility:str='author'
+    source:str='chatgpt_roleplay'
+    details:dict={}
+
+class BridgeBatchIn(BaseModel):events:list[BridgeEventIn]
+
+def bridge_store(c,event):
+    if not event.summary.strip() or len(event.summary)>8000:raise HTTPException(400,'Invalid summary')
+    if event.visibility not in ('public','private','author'):raise HTTPException(400,'Invalid visibility')
+    if len(event.participants)>50 or len(json.dumps(event.details))>16000:raise HTTPException(400,'Event too large')
+    t=event.fictional_time or now(c)
+    try:datetime.fromisoformat(t)
+    except ValueError:raise HTTPException(400,'Invalid fictional_time')
+    eid=event.external_id or str(uuid.uuid4())
+    if len(eid)>180 or len(event.event_type)>100 or len(event.source)>120:raise HTTPException(400,'Invalid identifier')
+    existing=c.execute('SELECT id FROM bridge_events WHERE external_id=?',(eid,)).fetchone()
+    if existing:return {'external_id':eid,'id':existing['id'],'duplicate':True}
+    cur=c.execute("""INSERT INTO bridge_events(external_id,fictional_time,event_type,summary,participants,location,visibility,source,details,received_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)""",(eid,t,event.event_type,event.summary.strip(),json.dumps(event.participants),event.location,event.visibility,event.source,json.dumps(event.details),stamp()))
+    return {'external_id':eid,'id':cur.lastrowid,'duplicate':False}
+
+@app.post('/api/bridge/events')
+def bridge_events_ingest(body:BridgeBatchIn,request:Request):
+    bridge_auth(request)
+    if not 1<=len(body.events)<=100:raise HTTPException(400,'Batch must contain 1 to 100 events')
+    with lock:
+        c=connect()
+        try:
+            results=[bridge_store(c,event) for event in body.events]
+            c.commit()
+        except Exception:
+            c.rollback();raise
+        finally:c.close()
+    return {'ok':True,'results':results,'canon_changed':False}
+
+@app.get('/api/bridge/events')
+def bridge_events_list(request:Request,after_id:int=0,limit:int=100,status:str|None=None):
+    bridge_auth(request)
+    if limit<1 or limit>500 or after_id<0:raise HTTPException(400,'Invalid pagination')
+    if status is not None and status not in ('staged','approved'):raise HTTPException(400,'Invalid status')
+    c=connect()
+    if status is None:r=rows(c,'SELECT * FROM bridge_events WHERE id>? ORDER BY id LIMIT ?',(after_id,limit))
+    else:r=rows(c,'SELECT * FROM bridge_events WHERE id>? AND status=? ORDER BY id LIMIT ?',(after_id,status,limit))
+    c.close()
+    for e in r:
+        e['participants']=json.loads(e['participants']);e['details']=json.loads(e['details'])
+    return {'events':r,'next_after_id':r[-1]['id'] if r else after_id}
+
+@app.post('/api/bridge/events/{event_id}/approve')
+def bridge_approve(event_id:int,request:Request):
+    # Only the owner session may approve; a bridge integration cannot canonize.
+    auth(request)
+    with lock:
+        c=connect();changed=c.execute("UPDATE bridge_events SET status='approved' WHERE id=? AND status='staged'",(event_id,)).rowcount
+        c.commit();c.close()
+    if not changed:raise HTTPException(404,'Staged event not found')
+    return {'ok':True,'note':'Approved for story review; does not grant NPC knowledge or change confirmed canon'}
